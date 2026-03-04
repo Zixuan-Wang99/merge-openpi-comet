@@ -421,11 +421,14 @@ class ViewConsistent3DRepresentation(nn.Module):
         hidden_dim: Optional[int] = None,
         pool_size: int = 14,
         dropout: float = 0.0,
+        tanh_gate_enable: bool = False,
+        tanh_gate_init_alpha: float = 0.0,
     ):
         super().__init__()
         self.visual_dim = visual_dim
         self.geometry_dim = geometry_dim
         self.view_dim = view_dim
+        self.tanh_gate_enable = tanh_gate_enable
         
         # 1. Adaptive 3D Position Injection
         self.position_injection = Adaptive3DPositionInjection(
@@ -448,6 +451,14 @@ class ViewConsistent3DRepresentation(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
         )
+        
+        # Flamingo-style tanh gate for cross-attention residual.
+        # When enabled, tanh(alpha) gates the fusion output at the residual connection.
+        # At init with alpha=0: tanh(0)=0 => fusion output suppressed, preserving pretrained representations.
+        if self.tanh_gate_enable:
+            self.fusion_gate = nn.Parameter(torch.tensor([tanh_gate_init_alpha]))
+        else:
+            self.fusion_gate = None
         
         # Residual connection with layer norm
         self.layer_norm = nn.LayerNorm(visual_dim)
@@ -496,7 +507,13 @@ class ViewConsistent3DRepresentation(nn.Module):
         target_dtype = self.layer_norm.weight.dtype
         position_aware_tokens = position_aware_tokens.to(target_dtype)
         fused_representation = fused_representation.to(target_dtype)
-        output = self.layer_norm(position_aware_tokens + fused_representation)
+        if self.fusion_gate is not None:
+            # Flamingo-style: gate = tanh(α), α initialized per config
+            gate = torch.tanh(self.fusion_gate)
+            output = self.layer_norm(position_aware_tokens + gate * fused_representation)
+        else:
+            # Paper-faithful: direct residual (no gating)
+            output = self.layer_norm(position_aware_tokens + fused_representation)
         output = output.to(original_dtype)
         
         return output

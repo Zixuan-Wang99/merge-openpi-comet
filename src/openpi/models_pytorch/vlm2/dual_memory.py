@@ -583,6 +583,11 @@ class DualMemoryModule(nn.Module):
             dropout=dropout,
         )
         
+        # Flamingo-style tanh gate for memory residual.
+        # Initialized to 0 so that tanh(0)=0 at init => memory output is suppressed,
+        # preserving the input representation. The gate gradually opens during training.
+        self.memory_gate = nn.Parameter(torch.zeros(1))
+        
         # Layer norm for output
         self.layer_norm = nn.LayerNorm(feature_dim)
     
@@ -652,12 +657,16 @@ class DualMemoryModule(nn.Module):
         fused_output = self.fusion(working_output, episodic_output)
         
         # Apply residual connection and normalization
+        # Flamingo-style: gate = tanh(α), α initialized to 0
+        # At init: output = LN(current_representation + 0) = LN(current_representation)
+        # During training: gate gradually opens to incorporate memory output
         original_dtype = current_representation.dtype
         target_dtype = self.layer_norm.weight.dtype
         # Note: we add memory output to the ORIGNAL representation, not the query
         current_representation = current_representation.to(target_dtype)
         fused_output = fused_output.to(target_dtype)
-        output = self.layer_norm(current_representation + fused_output)
+        gate = torch.tanh(self.memory_gate)
+        output = self.layer_norm(current_representation + gate * fused_output)
         output = output.to(original_dtype)
         
         if update_memory:

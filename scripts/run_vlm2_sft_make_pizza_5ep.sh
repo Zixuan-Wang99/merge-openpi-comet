@@ -13,7 +13,7 @@ export LD_LIBRARY_PATH="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/minic
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${REPO_ROOT}/.cache/openpi}"
 export B1K_VIDEO_BACKEND="${B1K_VIDEO_BACKEND:-video_reader}"
 
-export OPENPI_OFFLINE="${OPENPI_OFFLINE:-1}"
+export OPENPI_OFFLINE="${OPENPI_OFFLINE:-1}" 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
@@ -46,12 +46,13 @@ SAVE_AT_EPOCH_END_ONLY="${SAVE_AT_EPOCH_END_ONLY:-0}"
 FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-0}"
 PREPARE_HF_CACHE_ONLY="${PREPARE_HF_CACHE_ONLY:-0}"
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-}"
-NUM_WORKERS="${NUM_WORKERS:-}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 EXP_NAME="${EXP_NAME:-${CONFIG_NAME}_${TIMESTAMP}}"
 # default to config-exclusive cache, but allow external override for cache reuse
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/hf_datasets_cache/${CONFIG_NAME}}"
+# export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/hf_datasets_cache/${CONFIG_NAME}}"
+export HF_DATASETS_CACHE="/opt/tiger/hf_datasets_cache/${CONFIG_NAME}/" # use local cache 
 
 CONSOLE_LOG="checkpoints/console_logs/${EXP_NAME}.log"
 mkdir -p "$(dirname "${CONSOLE_LOG}")"

@@ -183,4 +183,4 @@ log
 
 # Checkpoints and large artifacts
 checkpoints/
-
+hf_datasets_cache/

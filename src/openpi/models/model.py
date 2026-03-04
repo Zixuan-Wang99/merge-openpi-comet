@@ -256,6 +256,7 @@ class BaseModelConfig(abc.ABC):
 
             model_cfg = train_config.model
             object.__setattr__(model_cfg, "dtype", train_config.pytorch_training_precision)
+            expert_cfg = getattr(model_cfg, "pytorch_action_expert", None)
             vlm2_config = _vlm2_model.VLM2Config(
                 visual_dim=2048,
                 geometry_dim=train_config.vlm2_geometry_dim,
@@ -283,9 +284,26 @@ class BaseModelConfig(abc.ABC):
                 freeze_vggt_backbone=getattr(model_cfg, "freeze_vggt_backbone", False),
                 freeze_image_encoder=getattr(model_cfg, "freeze_image_encoder", False),
             )
-            model = _vlm2_model.VLM2WithPi05(vlm2_config)
+            model = _vlm2_model.VLM2WithPi05(
+                vlm2_config,
+                action_expert_name=getattr(expert_cfg, "name", "gemma_token"),
+                action_expert_kwargs=(
+                    dataclasses.asdict(getattr(expert_cfg, "il_moe_velocity"))
+                    if getattr(expert_cfg, "name", "gemma_token") == "il_moe_velocity"
+                    else None
+                ),
+            )
         else:
-            model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+            model = pi0_pytorch.PI0Pytorch(
+                config=train_config.model,
+                action_expert_name=getattr(getattr(train_config.model, "pytorch_action_expert", None), "name", "gemma_token"),
+                action_expert_kwargs=(
+                    dataclasses.asdict(getattr(getattr(train_config.model, "pytorch_action_expert", None), "il_moe_velocity"))
+                    if getattr(getattr(train_config.model, "pytorch_action_expert", None), "name", "gemma_token")
+                    == "il_moe_velocity"
+                    else None
+                ),
+            )
         safetensors.torch.load_model(model, weight_path)
         return model
 

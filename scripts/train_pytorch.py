@@ -676,6 +676,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             episodic_memory_capacity=config.vlm2_episodic_memory_capacity,
             episodic_similarity_threshold=config.vlm2_episodic_similarity_threshold,
             episodic_fusion_alpha=config.vlm2_episodic_fusion_alpha,
+            sem_geo_fusion_tanh_gate_enable=config.vlm2_sem_geo_fusion_tanh_gate_enable,
+            sem_geo_fusion_tanh_gate_init_alpha=config.vlm2_sem_geo_fusion_tanh_gate_init_alpha,
             num_heads=8,
             hidden_dim=1024,
             dropout=0.0,
@@ -753,6 +755,23 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
+
+    # Auto-compute decay_steps when set to 0 (sentinel for "match total training duration")
+    # or when explicitly smaller than num_train_steps in epoch-based training.
+    if decay_steps <= 0:
+        decay_steps = config.num_train_steps
+        logging.info(
+            "Auto-set decay_steps=%d to match num_train_steps",
+            decay_steps,
+        )
+    elif decay_steps < config.num_train_steps:
+        logging.warning(
+            "decay_steps=%d < num_train_steps=%d — LR will reach 0 before training ends! "
+            "Override decay_steps to num_train_steps.",
+            decay_steps,
+            config.num_train_steps,
+        )
+        decay_steps = config.num_train_steps
 
     optim_params = [p for p in model.parameters() if p.requires_grad]
     if len(optim_params) == 0:
@@ -939,6 +958,21 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+
+                    # Log VLM2 tanh gate values if present
+                    if hasattr(model, "module"):
+                        _m = model.module
+                    else:
+                        _m = model
+                    if hasattr(_m, "perception") and hasattr(_m.perception, "view_consistent_3d"):
+                        vc3d = _m.perception.view_consistent_3d
+                        if getattr(vc3d, "fusion_gate", None) is not None:
+                            gate_val = torch.tanh(vc3d.fusion_gate).item()
+                            log_payload["vlm2/fusion_gate"] = gate_val
+                    if hasattr(_m, "memory") and hasattr(_m.memory, "memory_gate"):
+                        gate_val = torch.tanh(_m.memory.memory_gate).item()
+                        log_payload["vlm2/memory_gate"] = gate_val
+
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

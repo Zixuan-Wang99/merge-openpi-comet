@@ -191,9 +191,17 @@ class VLM2WithPi05(nn.Module):
         config: VLM2 configuration
     """
     
-    def __init__(self, config: VLM2Config):
+    def __init__(
+        self,
+        config: VLM2Config,
+        *,
+        action_expert_name: str = "gemma_token",
+        action_expert_kwargs: dict[str, Any] | None = None,
+    ):
         super().__init__()
         self.config = config
+        if action_expert_name != "gemma_token":
+            raise ValueError(f"VLM2WithPi05 currently supports only action_expert_name='gemma_token', got {action_expert_name}")
         
         if not HAS_PI05:
             raise RuntimeError(
@@ -289,11 +297,6 @@ class VLM2WithPi05(nn.Module):
         else:
             self.repr_to_llm = nn.Linear(actual_visual_dim, paligemma_config.width)
 
-        # Learnable residual gates to warm-start from PI0.5 behavior and gradually
-        # introduce VLM2-specific perception/memory deltas.
-        self.perception_delta_scale = nn.Parameter(torch.tensor(0.0))
-        self.memory_delta_scale = nn.Parameter(torch.tensor(0.0))
-        
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
     
@@ -352,27 +355,17 @@ class VLM2WithPi05(nn.Module):
             visual_tokens_spatial = rearrange(visual_tokens, 'b (h w) c -> b h w c', h=h, w=w)
             
             # Apply VLM2 perception (3D-aware representation)
-            # Passes frame images to perception module which uses VGGT
+            # Returns H_t = LN(F_pa_t + CrossAttn(F_pa_t, G_vc_t)) per paper Eq (4)
             representation = self.perception(visual_tokens_spatial, frame)
-
-            # Warm-start: keep close to base PI0.5 image tokens at initialization.
-            # perception_delta_scale starts at 0.0; gate is unconstrained (ReZero-style)
-            # so gradients never saturate and the model can grow the gate freely.
-            base_representation = rearrange(visual_tokens_spatial, 'b h w c -> b (h w) c')
-            perception_gate = self.perception_delta_scale
-            representation = base_representation + perception_gate * (representation - base_representation)
             
             # Apply VLM2 memory with text query
+            # Returns M_t = LN(H_t + GatedFusion(W_t, E_t)) per paper Algorithm 1
             memory_enhanced = self.memory(
                 representation, 
                 text_query=text_query, 
                 text_mask=text_mask,
                 update_memory=True
             )
-
-            # Warm-start memory path as residual delta (ReZero-style, unconstrained).
-            memory_gate = self.memory_delta_scale
-            memory_enhanced = representation + memory_gate * (memory_enhanced - representation)
             
             all_representations.append(memory_enhanced)
         

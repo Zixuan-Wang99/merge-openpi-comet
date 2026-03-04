@@ -7,6 +7,7 @@ from typing_extensions import override
 
 from openpi.models import gemma as _gemma
 from openpi.models import model as _model
+from openpi.models.action_expert_config import PytorchActionExpertConfig
 import openpi.shared.array_typing as at
 
 if TYPE_CHECKING:
@@ -18,6 +19,7 @@ class VLM2VLAConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
+    pytorch_action_expert: PytorchActionExpertConfig = dataclasses.field(default_factory=PytorchActionExpertConfig)
 
     action_dim: int = 32
     action_horizon: int = 50

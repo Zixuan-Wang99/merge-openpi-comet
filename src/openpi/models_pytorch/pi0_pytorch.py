@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -8,6 +9,7 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+from openpi.models_pytorch.action_experts import create_action_expert
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -83,7 +85,13 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class PI0Pytorch(nn.Module):
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        *,
+        action_expert_name: str = "gemma_token",
+        action_expert_kwargs: dict[str, Any] | None = None,
+    ):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
@@ -125,6 +133,14 @@ class PI0Pytorch(nn.Module):
         except ImportError:
             raise ValueError(msg) from None
 
+        self.action_expert = create_action_expert(
+            action_expert_name,
+            vlm_width=paligemma_config.width,
+            action_dim=config.action_dim,
+            pi05=self.pi05,
+            kwargs=action_expert_kwargs,
+        )
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
@@ -159,6 +175,9 @@ class PI0Pytorch(nn.Module):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+
+    def make_att_2d_masks(self, pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch.Tensor:
+        return make_att_2d_masks(pad_masks, att_masks)
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -328,49 +347,16 @@ class PI0Pytorch(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        v_t = self.action_expert.compute_velocity_train(
+            model=self,
+            images=images,
+            img_masks=img_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            state=state,
+            x_t=x_t,
+            time=time,
         )
-
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-
-        # Apply gradient checkpointing to final action projection if enabled
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
-
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
@@ -383,21 +369,12 @@ class PI0Pytorch(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+        prefix_ctx = self.action_expert.encode_prefix(
+            model=self,
+            images=images,
+            img_masks=img_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
         )
 
         dt = -1.0 / num_steps
@@ -407,12 +384,12 @@ class PI0Pytorch(nn.Module):
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
+            v_t = self.action_expert.compute_velocity_infer(
+                model=self,
+                prefix_ctx=prefix_ctx,
+                state=state,
+                x_t=x_t,
+                time=expanded_time,
             )
 
             # Euler step - use new tensor assignment instead of in-place operation

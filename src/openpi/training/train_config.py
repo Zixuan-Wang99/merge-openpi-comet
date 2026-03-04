@@ -44,6 +44,8 @@ class TrainConfig:
     vlm2_episodic_similarity_threshold: float = 0.7
     vlm2_episodic_fusion_alpha: float = 0.5
     vlm2_num_frames: int = 3
+    vlm2_sem_geo_fusion_tanh_gate_enable: bool = False
+    vlm2_sem_geo_fusion_tanh_gate_init_alpha: float = 0.0
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
 

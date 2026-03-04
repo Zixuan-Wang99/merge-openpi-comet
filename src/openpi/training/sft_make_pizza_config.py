@@ -42,7 +42,13 @@ _SFT_MAKE_PIZZA_CONFIGS = [
             # save_at_epoch_end_only=True,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 peak_lr=2.5e-6,
-                decay_steps=20_000,
+                # decay_steps must span the full training duration.
+                # 5 epochs × ~40k steps/epoch ≈ 200k total steps.
+                # Setting 0 = auto-match to num_train_steps (handled by train_pytorch.py).
+                decay_steps=0,
+                # Non-zero end LR prevents complete learning stall at end of training.
+                # pi-0 uses end_lr = 75% of peak; we use ~10% as a conservative floor.
+                decay_lr=2.5e-7,
             ),
             freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, max_token_len=512).get_freeze_filter(),
             ema_decay=None,
@@ -79,7 +85,10 @@ _SFT_MAKE_PIZZA_CONFIGS = [
             # save_at_epoch_end_only=True,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 peak_lr=2.5e-6,
-                decay_steps=20_000,
+                # decay_steps must span the full training duration.
+                # Setting 0 = auto-match to num_train_steps (handled by train_pytorch.py).
+                decay_steps=0,
+                decay_lr=2.5e-7,
             ),
             freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, max_token_len=512).get_freeze_filter(),
             ema_decay=None,

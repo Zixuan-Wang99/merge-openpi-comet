@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models.action_expert_config import PytorchActionExpertConfig
 from openpi.models import model as _model
 import openpi.models.gemma as _gemma
 import openpi.models.pointnet as _pointnet
@@ -22,6 +23,7 @@ class Pi0Config(_model.BaseModelConfig):
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
     pointnet_variant: _pointnet.Variant = "pcd"
+    pytorch_action_expert: PytorchActionExpertConfig = dataclasses.field(default_factory=PytorchActionExpertConfig)
 
     # Set the model specific defaults.
     action_dim: int = 32

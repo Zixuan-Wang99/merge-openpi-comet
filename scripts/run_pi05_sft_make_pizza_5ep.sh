@@ -52,7 +52,8 @@ NUM_WORKERS="${NUM_WORKERS:-}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 EXP_NAME="${EXP_NAME:-${CONFIG_NAME}_${TIMESTAMP}}"
 # default to config-exclusive cache, but allow external override for cache reuse
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/hf_datasets_cache/${CONFIG_NAME}}"
+# export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/hf_datasets_cache/${CONFIG_NAME}}"
+export HF_DATASETS_CACHE="/opt/tiger/hf_datasets_cache/${CONFIG_NAME}/" #
 
 CONSOLE_LOG="checkpoints/console_logs/${EXP_NAME}.log"
 mkdir -p "$(dirname "${CONSOLE_LOG}")"
