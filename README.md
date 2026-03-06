@@ -97,12 +97,10 @@ Openpi uses [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See 
 
 ```bash
 cd openpi-comet
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+conda create -n openpi python=3.11 -y
+pip install uv
+uv pip install -e .
 
-source .venv/bin/activate
-
-# Install behavior for server deploy 
 cd $PATH_TO_BEHAVIOR_1K
 uv pip install -e bddl
 uv pip install -e OmniGibson[eval]
