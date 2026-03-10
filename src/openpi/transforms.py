@@ -324,7 +324,84 @@ class TokenizePrompt(DataTransformFn):
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
+# TokenizeSubtaskTraining: joint CE + flow-matching training
+@dataclasses.dataclass(frozen=True)
+class TokenizeSubtaskTraining(DataTransformFn):
+    """
+    Tokenize prompt for Pi0.5 subtask training (joint CE + flow-matching loss).
 
+    Produces combined prompt: "[BOS] Task: <high>. Subtask: <low> [EOS] [PAD...]"
+    with token_ar_mask (causal on subtask portion) and token_loss_mask (CE loss on subtask+EOS only).
+
+    Data dict must contain:
+        - "prompt": high-level task instruction (e.g. "pick up the red block")
+        - "subtask": low-level subtask instruction (optional; defaults to prompt for
+          identity subtask training)
+
+    If "subtask" is absent, falls back to identity: high = low = prompt.
+    This allows mixed datasets where some samples have subtask annotations and others
+    do not — those without will still get subtask CE loss on the identity subtask.
+
+    """
+    tokenizer: _tokenizer.PaligemmaTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prompt = data.pop("prompt", None)
+        if prompt is None:
+            raise ValueError("Prompt is required for subtask training")
+        if not isinstance(prompt, str):
+            prompt = prompt.item() if hasattr(prompt, "item") else str(prompt)
+
+        # Extract subtask if available; default to identity subtask
+        subtask = data.pop("subtask", None)
+        if subtask is None:
+            # Identity subtask: high = low = prompt
+            high_prompt = prompt
+            low_prompt = prompt
+        else:
+            if not isinstance(subtask, str):
+                subtask = subtask.item() if hasattr(subtask, "item") else str(subtask)
+            high_prompt = prompt
+            low_prompt = subtask
+
+        tokens, mask, ar_mask, loss_mask = self.tokenizer.tokenize_high_low_prompt(
+            high_prompt, low_prompt
+        )
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": mask,
+            "token_ar_mask": ar_mask,
+            "token_loss_mask": loss_mask,
+        }
+
+# TokenizeSubtaskInference: prefix-only for autoregressive generation
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeSubtaskInference(DataTransformFn):
+    """
+    Tokenize only the high-level prefix for Pi0.5 subtask inference.
+
+    Produces: "[BOS] Task: <high>. Subtask: " [PAD...]
+    The model will autoregressively generate the subtask tokens during inference.
+    Does NOT produce token_ar_mask or token_loss_mask (inference-only).
+    """
+    tokenizer: _tokenizer.PaligemmaTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prompt = data.pop("prompt", None)
+        if prompt is None:
+            raise ValueError("Prompt is required for subtask inference")
+        if not isinstance(prompt, str):
+            prompt = prompt.item() if hasattr(prompt, "item") else str(prompt)
+
+        tokens, mask = self.tokenizer.tokenize_high_level_prefix(prompt)
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": mask,
+        }
+    
 @dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer

@@ -15,11 +15,9 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
 
-
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
-
 
 def create_torch_dataloader(
     data_config: _config.DataConfig,
@@ -29,9 +27,12 @@ def create_torch_dataloader(
     num_workers: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
+    
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
+    
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -47,6 +48,7 @@ def create_torch_dataloader(
     else:
         num_batches = len(dataset) // batch_size
         shuffle = False
+
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
@@ -88,13 +90,15 @@ def create_rlds_dataloader(
 
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
+
+    ## TODO 如果是多个数据集 list, 会导致只取出第一个数据集的 stats
     if isinstance(config.data, list):
         data_config = config.data[0].create(config.assets_dirs, config.model)
     else:
         data_config = config.data.create(config.assets_dirs, config.model)
+
     if data_config.behavior_dataset_root:
         from omnigibson.learning.datas import BehaviorLerobotDatasetMetadata
-
         from openpi.policies.b1k_policy import extract_state_from_proprio
 
         metadata = BehaviorLerobotDatasetMetadata(
@@ -104,7 +108,9 @@ def main(config_name: str, max_frames: int | None = None):
             modalities=[],
             cameras=[],
         )
+
         stats = metadata.stats
+
         if data_config.episodes_index is not None:
             from omnigibson.learning.datas import BehaviorLeRobotDataset
 
@@ -124,6 +130,7 @@ def main(config_name: str, max_frames: int | None = None):
                 extract_state_from_proprio(stats["observation.state"][key]), config.model.action_dim
             )
             norm_stats["actions"][key] = transforms.pad_to_dim(stats["action"][key], config.model.action_dim)
+            
     else:
         if data_config.rlds_data_dir is not None:
             data_loader, num_batches = create_rlds_dataloader(

@@ -144,6 +144,12 @@ class ModelTransformFactory(GroupFactory):
     rearrange_action_indices: Sequence[int] | None = None
 
     model_delta_action_mask: Sequence[int] | None = None
+    
+    # Enable subtask tokenization 
+    # When True, the PI05_SUBTASK model type branch is activated.
+    # TokenizeSubtaskTraining replaces TokenizePrompt and produces the
+    # token_ar_mask + token_loss_mask needed by the model forward.
+    enable_subtask: bool = False
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         meta_input_transforms = []
@@ -191,6 +197,29 @@ class ModelTransformFactory(GroupFactory):
                         *meta_output_transforms[::-1],  # inverse
                     ],
                 )
+            
+            # New model type for subtask training 
+            case _model.ModelType.PI05_SUBTASK:
+                assert isinstance(model_config, (pi0_config.Pi0Config, vlm2_vla_config.VLM2VLAConfig))
+                tokenizer = _tokenizer.PaligemmaTokenizer(model_config.max_token_len)
+                return _transforms.Group(
+                    inputs=[
+                        *meta_input_transforms,
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        # TokenizeSubtaskTraining replaces TokenizePrompt.
+                        # It produces: tokenized_prompt, tokenized_prompt_mask,
+                        #               token_ar_mask, token_loss_mask
+                        # The "subtask" field must be present in the data dict
+                        # (passed through by RepackTransform).
+                        _transforms.TokenizeSubtaskTraining(tokenizer=tokenizer),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                    outputs=[
+                        *meta_output_transforms[::-1],  # inverse
+                    ],
+                )
+            
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -234,7 +263,7 @@ class DataConfigFactory(abc.ABC):
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
-
+ 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
@@ -280,21 +309,24 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
     model_delta_action_mask: Sequence[int] | None = None
 
+    enable_subtask: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_mapping = {
+            "observation/egocentric_camera": "observation.images.rgb.head",
+            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        # [SUBTASK v4] Pass through subtask field for subtask training
+        if self.enable_subtask:
+            repack_mapping["subtask"] = "subtask"
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/egocentric_camera": "observation.images.rgb.head",
-                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_mapping)]
         )
 
         data_transforms = _transforms.Group(
@@ -318,6 +350,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # [SUBTASK v4] Forward subtask setting
+            enable_subtask=self.enable_subtask,
         )(model_config)
 
         return dataclasses.replace(
@@ -346,22 +380,25 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
 
     pcd_downsample: int = 9
 
+    enable_subtask: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_mapping = {
+            "observation/egocentric_camera": "observation.images.rgb.head",
+            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/egocentric_depth": "observation.images.depth.head",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        # [SUBTASK v4] Pass through subtask field
+        if self.enable_subtask:
+            repack_mapping["subtask"] = "subtask"
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/egocentric_camera": "observation.images.rgb.head",
-                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
-                        "observation/egocentric_depth": "observation.images.depth.head",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_mapping)]
         )
 
         data_transforms = _transforms.Group(
@@ -393,6 +430,8 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # [SUBTASK v4] Forward subtask setting
+            enable_subtask=self.enable_subtask,
         )(model_config)
 
         return dataclasses.replace(
@@ -421,22 +460,25 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
 
     pcd_downsample: int = 9
 
+    enable_subtask: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_mapping = {
+            "observation/egocentric_camera": "observation.images.rgb.head",
+            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/egocentric_seg": "observation.images.seg.head",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        # [SUBTASK v4] Pass through subtask field
+        if self.enable_subtask:
+            repack_mapping["subtask"] = "subtask"
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/egocentric_camera": "observation.images.rgb.head",
-                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
-                        "observation/egocentric_seg": "observation.images.seg.head",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_mapping)]
         )
 
         data_transforms = _transforms.Group(
@@ -468,6 +510,8 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
+            # [SUBTASK v4] Forward subtask setting
+            enable_subtask=self.enable_subtask,
         )(model_config)
 
         return dataclasses.replace(

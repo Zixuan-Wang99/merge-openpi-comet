@@ -10,11 +10,13 @@ Single GPU:
   Example:
   python scripts/train_pytorch.py debug --exp_name pytorch_ddp_test
   python scripts/train_pytorch.py debug --exp_name pytorch_ddp_test --resume  # Resume from latest checkpoint
+
 Multi-GPU (single node):
   torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
   Example:
   torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
   torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
+  
 Multi-Node Training:
 	torchrun \
     --nnodes=<num_nodes> --nproc_per_node=<gpus_per_node> --node_rank=<rank_of_node> \
@@ -484,6 +486,26 @@ def _prepare_vlm2_inputs(observation, config: _config.TrainConfig, device: torch
 
     return video_frames, point_maps, language_tokens, language_masks
 
+# Helper to extract subtask masks from observation ======
+def _extract_subtask_masks(observation, device: torch.device):
+    """
+    Extract token_ar_mask and token_loss_mask from observation if available.
+    Returns:
+        (token_ar_mask, token_loss_mask) or (None, None) if not present.
+    """
+    token_ar_mask = getattr(observation, "token_ar_mask", None)
+    token_loss_mask = getattr(observation, "token_loss_mask", None)
+
+    if token_ar_mask is None or token_loss_mask is None:
+        return None, None
+
+    if not isinstance(token_ar_mask, torch.Tensor):
+        token_ar_mask = torch.as_tensor(token_ar_mask, device=device)
+    if not isinstance(token_loss_mask, torch.Tensor):
+        token_loss_mask = torch.as_tensor(token_loss_mask, device=device)
+
+    return token_ar_mask, token_loss_mask
+
 
 def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
     use_ddp, local_rank, device = setup_ddp()
@@ -726,7 +748,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=False,  # Disable for memory efficiency
+            find_unused_parameters=True,  # Disable for memory efficiency
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
@@ -801,6 +823,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
+    
+    # Subtask CE loss is handled inside model forward.
+    # Detect subtask training by checking if observation has token_loss_mask.
+    has_subtask_training = True
+
 
     model.train()
     start_time = time.time()
@@ -875,13 +902,20 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                     )
                 else:
                     losses = model(observation, actions)
-                # Ensure losses is a tensor and handle different return types
+
+                # When subtask is active: loss = subtask_ce[:, None, None] + flow_mse
+                # When no subtask: loss = flow_mse
+                # Either way, it's a tensor we can .mean()
                 if isinstance(losses, list | tuple):
                     losses = torch.stack(losses)
                 elif not isinstance(losses, torch.Tensor):
                     losses = torch.tensor(losses, device=device, dtype=torch.float32)
-
                 loss = losses.mean()
+                # For logging: we don't have separate flow/subtask values
+                # since they're combined in the model. Log the combined loss.
+                flow_loss = loss
+                subtask_loss_val = torch.tensor(0.0, device=device)
+
             loss = loss.float()
 
             # Backward pass
@@ -911,6 +945,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                         "loss": loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        "flow_loss": float(flow_loss) if isinstance(flow_loss, torch.Tensor) else flow_loss,
                     }
                 )
 
@@ -937,18 +972,23 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                     ]
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
+
+                avg_flow_loss = sum(info.get("flow_loss", 0) for info in infos) / len(infos)
+
                 logging.info(
                     f"step={global_step} epoch={epoch} epoch_step={epoch_step}/{steps_per_epoch} "
                     f"loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
                     else f"step={global_step} epoch={epoch} epoch_step={epoch_step}/{steps_per_epoch} "
                     f"loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    f"flow_loss={avg_flow_loss:.4f}",
                 )
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
                         "loss": avg_loss,
+                        "flow_loss": avg_flow_loss,
                         "learning_rate": avg_lr,
                         "step": global_step,
                         "epoch": epoch,

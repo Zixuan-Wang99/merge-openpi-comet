@@ -141,6 +141,20 @@ class PI0Pytorch(nn.Module):
             kwargs=action_expert_kwargs,
         )
 
+        # Store lm_head reference for decode_to_logits 
+        # PaliGemma's lm_head is nn.Linear(hidden_size, vocab_size, bias=False),
+        # tied with embed_tokens.weight via _tied_weights_keys.
+        # We store it as a plain Python attribute to avoid accidentally
+        # registering it as a submodule (which could interfere with freezing).
+        _paligemma = self.paligemma_with_expert.paligemma
+        object.__setattr__(self, "_lm_head_ref", _paligemma.lm_head)
+        logging.info(
+            "PI0Pytorch: stored lm_head reference for subtask decode_to_logits "
+            "(lm_head shape: %s, tied with embed_tokens)",
+            list(_paligemma.lm_head.weight.shape),
+        )
+
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
@@ -203,6 +217,84 @@ class PI0Pytorch(nn.Module):
         time_beta = sample_beta(1.5, 1.0, bsize, device)
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
+    
+    # decode_to_logits: hidden → vocab logits via lm_head 
+    def decode_to_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project hidden states to vocabulary logits using PaliGemma's lm_head.
+        Args:
+            hidden_states: [B, S, hidden_dim] — already RMSNormed.
+        Returns:
+            logits: [B, S, vocab_size]
+        """
+        lm_head = self._lm_head_ref
+        return lm_head(hidden_states.to(dtype=lm_head.weight.dtype))
+    
+    # Next-token prediction CE on subtask region
+    def _compute_subtask_ce_loss(
+        self,
+        prefix_out: torch.Tensor,
+        observation,
+        num_image_tokens: int,
+    ) -> torch.Tensor: 
+        """
+        Compute cross-entropy loss on the subtask portion of the prefix.
+        Uses next-token prediction: hidden[i] predicts token[i+1].
+        Loss is masked to only the subtask region via observation.token_loss_mask.
+
+        text_hidden = prefix_out[:, num_image_tokens : num_image_tokens + num_text - 1, :]
+        logits = self.PaliGemma.llm(text_hidden, method="decode_to_logits")
+        targets = observation.tokenized_prompt[:, 1:]
+        loss_mask = observation.token_loss_mask[:, 1:].float()
+        log_probs = log_softmax(logits)
+        token_nll = -gather(log_probs, targets)
+        masked_nll = token_nll * loss_mask
+        return sum(masked_nll, dim=-1) / clip(sum(loss_mask, dim=-1), min=1)
+
+        Args:
+            prefix_out: [B, prefix_S, hidden_dim] — VLM prefix hidden states (after RMSNorm from compute_final_norms).
+            observation: Must have tokenized_prompt [B, max_token_len] and token_loss_mask [B, max_token_len].
+            num_image_tokens: Number of image tokens before text in prefix.
+
+        Returns:
+            Per-sample CE loss [B].
+        """
+
+        num_text = self.config.max_token_len
+
+        # Extract text hidden states, shifted left by 1 for next-token prediction.
+        # hidden[i] predicts token[i+1], so we take positions [0..num_text-2]
+        # to predict targets at positions [1..num_text-1].
+
+        text_hidden = prefix_out[:, num_image_tokens : num_image_tokens + num_text - 1, :]
+
+        # Project to vocab space via lm_head (tied with embed_tokens)
+        logits = self.decode_to_logits(text_hidden)  # [B, num_text-1, vocab_size]
+        logits = logits.float()  # fp32 for numerical stability
+
+        # Targets: shifted by 1 (next token)
+        targets = observation.tokenized_prompt[:, 1:]  # [B, num_text-1]
+        if not isinstance(targets, torch.Tensor):
+            targets = torch.as_tensor(targets, device=logits.device)
+        targets = targets.long()
+
+        # Loss mask: shifted by 1 to align with targets
+        loss_mask = observation.token_loss_mask[:, 1:]  # [B, num_text-1]
+        if not isinstance(loss_mask, torch.Tensor):
+            loss_mask = torch.as_tensor(loss_mask, device=logits.device)
+        loss_mask = loss_mask.float()
+
+        # Compute per-token negative log-likelihood
+        log_probs = F.log_softmax(logits, dim=-1)  # [B, num_text-1, vocab_size]
+        token_nll = -torch.gather(
+            log_probs, dim=-1, index=targets.unsqueeze(-1)
+        ).squeeze(-1)  # [B, num_text-1]
+
+        # Masked average per sample
+        masked_nll = token_nll * loss_mask
+        per_sample_loss = masked_nll.sum(dim=-1) / loss_mask.sum(dim=-1).clamp(min=1.0)
+        # per_sample_loss: [B]
+
+        return per_sample_loss
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
@@ -336,6 +428,23 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """Training forward pass.
+
+        Returns:
+            loss: [B, action_horizon, action_dim] per-element loss tensor.
+
+            When subtask data is available (observation has token_loss_mask),
+            the returned loss is:
+                subtask_ce_loss[:, None, None] + flow_mse_loss
+            where subtask_ce_loss is [B] and flow_mse_loss is [B, AH, AD].
+
+            When no subtask data is present, returns plain flow_mse_loss.
+
+            subtask_loss[:, None] + flow_loss, except we keep the action_dim
+            dimension to stay compatible with the existing training loop that
+            calls loss.mean().
+        """
+
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
@@ -347,19 +456,66 @@ class PI0Pytorch(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        v_t = self.action_expert.compute_velocity_train(
-            model=self,
-            images=images,
-            img_masks=img_masks,
-            lang_tokens=lang_tokens,
-            lang_masks=lang_masks,
-            state=state,
-            x_t=x_t,
-            time=time,
+
+
+        # Check whether subtask training data is available
+        has_subtask = (
+            hasattr(observation, "token_loss_mask")
+            and observation.token_loss_mask is not None
+            and hasattr(observation, "token_ar_mask")
+            and observation.token_ar_mask is not None
         )
+        
+        if has_subtask and hasattr(self.action_expert, "compute_velocity_train_with_prefix"):
+            # Subtask path: get prefix hidden states for CE loss + use token_ar_mask
+            token_ar_mask = observation.token_ar_mask
+            if not isinstance(token_ar_mask, torch.Tensor):
+                token_ar_mask = torch.as_tensor(token_ar_mask, device=actions.device)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+            v_t, prefix_output, prefix_pad_masks = self.action_expert.compute_velocity_train_with_prefix(
+                model=self,
+                images=images,
+                img_masks=img_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+                state=state,
+                x_t=x_t,
+                time=time,
+                token_ar_mask=token_ar_mask,
+            )
+        else:
+            # Standard path: no subtask
+            v_t = self.action_expert.compute_velocity_train(
+                model=self,
+                images=images,
+                img_masks=img_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+                state=state,
+                x_t=x_t,
+                time=time,
+            )
+            prefix_output = None
+        
+        flow_loss = F.mse_loss(u_t, v_t, reduction="none")
+        
+        if has_subtask and prefix_output is not None:
+            # Compute number of image tokens in prefix
+            prefix_S = prefix_output.shape[1]
+            num_text = self.config.max_token_len
+            num_image_tokens = prefix_S - num_text
 
+            subtask_ce = self._compute_subtask_ce_loss(
+                prefix_output, observation, num_image_tokens
+            )
+            # subtask_ce: [B]
+            # Add to flow loss: subtask_ce[:, None, None] + flow_loss[:, AH, AD]
+            loss = subtask_ce[:, None, None] + flow_loss
+        else:
+            loss = flow_loss
+
+        return loss
+            
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""

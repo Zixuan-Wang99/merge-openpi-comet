@@ -9,7 +9,10 @@ from transformers import AutoProcessor
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
+import string
 
+# PaliGemma special token IDs
+PALIGEMMA_EOS_TOKEN = 1
 
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
@@ -46,6 +49,108 @@ class PaligemmaTokenizer:
             mask = [True] * self._max_len
 
         return np.asarray(tokens), np.asarray(mask)
+    
+    def tokenize_high_low_prompt(
+        self, high_prompt: str, low_prompt: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Tokenize a high-level + low-level prompt pair for subtask training.
+
+        Produces the combined token sequence:
+            [BOS] "Task: <high>. Subtask: " <low> [EOS] [PAD...]
+
+        AR mask:  0 (bidirectional) for the prefix, 1 (causal) for the subtask + EOS.
+        Loss mask: False for the prefix, True for the subtask + EOS.
+
+        Args:
+            high_prompt: High-level task instruction.
+            low_prompt:  Low-level subtask instruction.
+
+        Returns:
+            tokens:    int32[max_len]
+            mask:      bool[max_len]   — True for real tokens, False for padding.
+            ar_mask:   int32[max_len]  — 0 = bidirectional, 1 = causal.
+            loss_mask: bool[max_len]   — True where CE loss is applied.
+        """
+        cleaned_high = high_prompt.lower().strip().replace("_", " ").replace("\n", " ")
+        if cleaned_high and cleaned_high[-1] in string.punctuation:
+            cleaned_high = cleaned_high[:-1]
+        prefix_str = f"Task: {cleaned_high}. Subtask: "
+        prefix_tokens = self._tokenizer.encode(prefix_str, add_bos=True)
+
+        cleaned_low = low_prompt.lower().strip().replace("_", " ").replace("\n", " ")
+        if cleaned_low and cleaned_low[-1] in string.punctuation:
+            cleaned_low = cleaned_low[:-1]
+        suffix_tokens = self._tokenizer.encode(cleaned_low) + [PALIGEMMA_EOS_TOKEN]
+
+        all_tokens = prefix_tokens + suffix_tokens
+        prefix_len = len(prefix_tokens)
+        suffix_len = len(suffix_tokens)
+        total_len = len(all_tokens)
+
+        ar_mask_list = [0] * prefix_len + [1] * suffix_len
+        loss_mask_list = [False] * prefix_len + [True] * suffix_len
+        mask_list = [True] * total_len
+
+        if total_len < self._max_len:
+            pad_len = self._max_len - total_len
+            all_tokens = all_tokens + [0] * pad_len
+            mask_list = mask_list + [False] * pad_len
+            ar_mask_list = ar_mask_list + [0] * pad_len
+            loss_mask_list = loss_mask_list + [False] * pad_len
+        else:
+            if total_len > self._max_len:
+                logging.warning(
+                    f"Subtask training token length ({total_len}) exceeds max ({self._max_len}), truncating."
+                )
+            all_tokens = all_tokens[: self._max_len]
+            mask_list = [True] * self._max_len
+            ar_mask_list = ar_mask_list[: self._max_len]
+            loss_mask_list = loss_mask_list[: self._max_len]
+
+        return (
+            np.asarray(all_tokens, dtype=np.int32),
+            np.asarray(mask_list, dtype=np.bool_),
+            np.asarray(ar_mask_list, dtype=np.int32),
+            np.asarray(loss_mask_list, dtype=np.bool_),
+        )
+
+    def tokenize_high_level_prefix(self, high_prompt: str) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Tokenize only the high-level prefix for subtask inference.
+
+        Produces: [BOS] "Task: <high>. Subtask: " [PAD...]
+        The model will autoregressively complete the subtask at inference time.
+
+        Returns:
+            tokens: int32[max_len]
+            mask:   bool[max_len] — True for real tokens, False for padding.
+        """
+        cleaned_high = high_prompt.lower().strip().replace("_", " ").replace("\n", " ")
+        if cleaned_high and cleaned_high[-1] in string.punctuation:
+            cleaned_high = cleaned_high[:-1]
+        prefix_str = f"Task: {cleaned_high}. Subtask: "
+        tokens = self._tokenizer.encode(prefix_str, add_bos=True)
+
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            pad_len = self._max_len - tokens_len
+            mask = [True] * tokens_len + [False] * pad_len
+            tokens = tokens + [0] * pad_len
+        else:
+            if tokens_len > self._max_len:
+                logging.warning(
+                    f"Prefix token length ({tokens_len}) exceeds max ({self._max_len}), truncating."
+                )
+            tokens = tokens[: self._max_len]
+            mask = [True] * self._max_len
+
+        return np.asarray(tokens, dtype=np.int32), np.asarray(mask, dtype=np.bool_)
+
+    def detokenize(self, tokens: np.ndarray) -> str:
+        """Decode token IDs back to text, skipping padding (0) and EOS (1)."""
+        valid = [int(t) for t in tokens if t != 0 and t != PALIGEMMA_EOS_TOKEN]
+        return self._tokenizer.decode(valid)
 
 
 class FASTTokenizer:

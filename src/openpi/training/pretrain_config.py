@@ -249,4 +249,38 @@ _PRETRAIN_CONFIGS = [
         num_workers=8,
         batch_size=8 * 32,
     ),
+    TrainConfig(
+        name="pi05_subtask_b1k-pt50_cs32_bs64_lr2.5e-5_5ep",  
+        exp_name="openpi",
+        project_name="B1K_wangzixuan",
+        model=pi0_config.Pi05SubtaskConfig(action_horizon=32), 
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="checkpoints/openpi_comet/pi05-b1kpt50-cs32/assets",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos/",
+                fine_grained_level=0,
+            ),
+            enable_subtask=True,  
+        ),
+        pytorch_weight_path="checkpoints/openpi_comet/pi05-b1kpt50-cs32",
+        weight_loader=weight_loaders.CheckpointWeightLoader("sunshk/openpi_comet/pi05-b1kpt50-cs32"),
+        num_train_steps=0,
+        num_train_epochs=5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=900_000,
+        ),
+        freeze_filter=pi0_config.Pi05SubtaskConfig(action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="checkpoints",
+        num_workers=16,
+        batch_size_per_gpu=64,
+    ),
 ]

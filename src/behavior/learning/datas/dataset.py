@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import random
 import time
-
+import re
 import datasets
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
@@ -237,6 +237,77 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
         self.prepare_task(fine_grained_level)
+        
+        self._obj_name_map = build_object_name_mapping(self.meta.annotations)
+        
+
+        self.skill_subtask_sizes = {}
+        self.skill_subtask_texts = {}
+        try:
+            for ep_id, ann in self.meta.annotations.items():
+                if "skill_annotation" not in ann:
+                    continue
+                skills = ann["skill_annotation"]
+                primitives = ann.get("primitive_annotation", [])
+
+                # 从 skill_annotation 提取 (start, end, text)
+                skill_spans = []
+                for skill_entry in skills:
+                    frame_dur = skill_entry["frame_duration"]
+                    s = frame_dur[0] if not isinstance(frame_dur[0], list) else frame_dur[0][0]
+                    e = frame_dur[1] if not isinstance(frame_dur[0], list) else frame_dur[-1][1]
+                    while isinstance(s, list):
+                        s = s[0]
+                    while isinstance(e, list):
+                        e = e[-1]
+                    s, e = int(s), int(e)
+                    text = skill_annotation_to_subtask(skill_entry)
+                    skill_spans.append((s, e, text))
+
+                # 按 start 排序
+                skill_spans.sort(key=lambda x: x[0])
+
+                # 构建 primitive 区间索引，用于填补间隙 
+                prim_spans = []
+                for prim_entry in primitives:
+                    pf = prim_entry["frame_duration"]
+                    ps = pf[0] if not isinstance(pf[0], list) else pf[0][0]
+                    pe = pf[1] if not isinstance(pf[0], list) else pf[-1][1]
+                    while isinstance(ps, list):
+                        ps = ps[0]
+                    while isinstance(pe, list):
+                        pe = pe[-1]
+                    ps, pe = int(ps), int(pe)
+                    prim_spans.append((ps, pe, prim_entry))
+
+                # 填补间隙，生成连续的 end_frames / subtask_texts
+                end_frames = []
+                subtask_texts = []
+                prev_end = -1  # 上一段的结束帧
+
+                for s, e, text in skill_spans:
+                    if s > prev_end + 1 and prev_end >= 0:
+                        gap_start, gap_end = prev_end + 1, s - 1
+                        # 在 primitive_annotation 中找覆盖此间隙的 primitive
+                        gap_text = None
+                        for ps, pe, prim_entry in prim_spans:
+                            if ps <= gap_start and pe >= gap_end:
+                                gap_text = skill_annotation_to_subtask(prim_entry)
+                                break
+                        if gap_text is None:
+                            gap_text = subtask_texts[-1] if subtask_texts else text
+                        end_frames.append(gap_end)
+                        subtask_texts.append(gap_text)
+
+                    end_frames.append(e)
+                    subtask_texts.append(text)
+                    prev_end = e
+
+                self.skill_subtask_sizes[ep_id] = end_frames
+                self.skill_subtask_texts[ep_id] = subtask_texts
+                
+        except Exception as e:
+            print(f"[warn] {self.repo_id} failed to build skill subtask lookup: {e}")
 
         self.omnigibson_mapping = {ep_idx: defaultdict(dict) for ep_idx in self.episodes}
 
@@ -441,6 +512,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
             item["task"] = self._get_fine_grained_task(item)
+            item["subtask"] = self._get_skill_subtask(item) 
             return item
 
         # Streaming mode: we will load the episode at the current streaming index, and then increment the index for next call
@@ -567,6 +639,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # Add task as a string
         item["task"] = self._get_fine_grained_task(item)
+        item["subtask"] = self._get_skill_subtask(item)
         self.current_streaming_frame_idx += 1
 
         return item
@@ -577,6 +650,29 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
         task_skill = self.meta.orchestrators[ep_idx][1][sub_idx]["task"]
         return task_skill
+    
+    def _get_skill_subtask(self, item: dict) -> str:
+        """
+        Look up the current frame's subtask from skill_annotation.
+        Returns a human-readable string like "move to radio".
+        Falls back to _get_fine_grained_task() if no skill annotation exists.
+
+        Uses the same bisect_right semantics as _get_fine_grained_task().
+        """
+        ep_idx = item["episode_index"].item()
+
+        if ep_idx not in self.skill_subtask_sizes:
+            return self._get_fine_grained_task(item)
+
+        frame_index = round(item["timestamp"].item() * self.fps)
+        end_frames = self.skill_subtask_sizes[ep_idx]
+        texts = self.skill_subtask_texts[ep_idx]
+
+        sub_idx = bisect.bisect_right(
+            end_frames, frame_index, hi=len(end_frames) - 1
+        )
+        return texts[sub_idx]
+
 
     def _get_fine_grained_task(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
@@ -896,3 +992,142 @@ class MultiBehaviorLeRobotDataset:
     def __getitem__(self, idx):
         index = np.random.choice(range(len(self.datasets)), p=self.sample_weights)
         return self.datasets[index][idx]
+
+# Master mapping: skill_description -> (verb, [preposition_list])
+_SKILL_PARSE_MAP = {
+    # Skills WITH preposition(s)
+    "pick up from":       ("pick up",  ["from"]),
+    "place on":           ("place",    ["on"]),
+    "place in":           ("place",    ["in"]),
+    "place under":        ("place",    ["under"]),
+    "place on next to":   ("place",    ["on", "next to"]),
+    "place in next to":   ("place",    ["in", "next to"]),
+    "push to":            ("push",     ["to"]),
+    "sweep off":          ("sweep",    ["off"]),
+    # Skills WITHOUT preposition
+    "move to":            ("move to",         []),
+    "press":              ("press",           []),
+    "attach":             ("attach",          []),
+    "chop":               ("chop",            []),
+    "close door":         ("close door",      []),
+    "close drawer":       ("close drawer",    []),
+    "close lid":          ("close lid",       []),
+    "hand over":          ("hand over",       []),
+    "hang":               ("hang",            []),
+    "hold":               ("hold",            []),
+    "ignite":             ("ignite",          []),
+    "insert":             ("insert",          []),
+    "open door":          ("open door",       []),
+    "open drawer":        ("open drawer",     []),
+    "open lid":           ("open lid",        []),
+    "pour":               ("pour",            []),
+    "pull tray":          ("pull tray",       []),
+    "push tray":          ("push tray",       []),
+    "release":            ("release",         []),
+    "spray":              ("spray",           []),
+    "sweep surface":      ("sweep surface",   []),
+    "tip over":           ("tip over",        []),
+    "turn off switch":    ("turn off switch", []),
+    "turn on switch":     ("turn on switch",  []),
+    "turn to":            ("turn to",         []),
+    "wipe hard":          ("wipe hard",       []),
+}
+
+def _clean_object_name(raw_id: str) -> str:
+    """
+    只去掉末尾的数字后缀，下划线转空格
+    Examples:
+        "radio_89"              → "radio"
+        "coffee_table_koagbh_0" → "coffee table koagbh"
+        "fridge_aqvwkq_0"       → "fridge aqvwkq"
+        "hinged_jar_nxczbw_0"   → "hinged jar nxczbw"
+        "trash_can_14"          → "trash can"
+    """
+    # 反复去掉末尾的 _数字
+    name = re.sub(r"(_\d+)+$", "", raw_id)
+    return name.replace("_", " ")
+
+
+def build_object_name_mapping(annotations: dict) -> dict:
+    """
+    扫描所有 annotations, 构建 object_id -> clean_name 映射
+    """
+    raw_ids = set()
+    for _ep_id, ann in annotations.items():
+        for skill_entry in ann.get("skill_annotation", []):
+            for obj_list in skill_entry.get("object_id", []):
+                # obj_list 可能是 ["radio_89", "table_0"] 或更深的嵌套
+                if isinstance(obj_list, str):
+                    raw_ids.add(obj_list)
+                elif isinstance(obj_list, list):
+                    for item in obj_list:
+                        if isinstance(item, str):
+                            raw_ids.add(item)
+                        elif isinstance(item, list):
+                            raw_ids.update(s for s in item if isinstance(s, str))
+            for obj_id in skill_entry.get("manipulating_object_id", []):
+                if isinstance(obj_id, str):
+                    raw_ids.add(obj_id)
+                elif isinstance(obj_id, list):
+                    raw_ids.update(s for s in obj_id if isinstance(s, str))
+    return {raw_id: _clean_object_name(raw_id) for raw_id in raw_ids}
+
+def skill_annotation_to_subtask(skill_entry: dict, obj_name_map: dict) -> str:
+    """Convert a single skill_annotation entry to a subtask text string."""
+
+    if "skill_description" in skill_entry:
+        skill_desc = skill_entry["skill_description"][0].strip()
+    elif "primitive_description" in skill_entry:
+        skill_desc = skill_entry["primitive_description"][0].strip()
+    else:
+        return "unknown"
+    # skill_desc = skill_entry["skill_description"][0].strip()
+
+    # 安全提取 object_id（处理嵌套列表）
+    raw_obj_list = skill_entry.get("object_id", [])
+    if raw_obj_list and isinstance(raw_obj_list[0], list):
+        raw_objects = raw_obj_list[0]
+    else:
+        raw_objects = raw_obj_list
+
+    manipulating = skill_entry.get("manipulating_object_id", [])
+    memory_prefix = skill_entry.get("memory_prefix", [])
+
+    def _clean(raw_id):
+        return obj_name_map.get(raw_id, _clean_object_name(raw_id))
+
+    clean_objects = [_clean(obj) for obj in raw_objects if isinstance(obj, str)]
+    clean_manipulating = _clean(manipulating[0]) if manipulating and isinstance(manipulating[0], str) else None
+
+    if not clean_objects:
+        return skill_desc
+
+    if skill_desc in _SKILL_PARSE_MAP:
+        verb, preps = _SKILL_PARSE_MAP[skill_desc]
+    else:
+        return f"{skill_desc} {' '.join(clean_objects)}"
+
+    if not preps:
+        return f"{verb} {' '.join(clean_objects)}"
+
+    # 有介词：拆分主物体和目标物体
+    if clean_manipulating:
+        main_obj = clean_manipulating
+        remaining = [c for r, c in zip(raw_objects, clean_objects)
+                     if r != manipulating[0]]
+        if len(remaining) == len(clean_objects):
+            remaining = clean_objects[1:]
+    else:
+        main_obj = clean_objects[0]
+        remaining = clean_objects[1:]
+
+    prefix_str = f" {memory_prefix[0]}" if memory_prefix else ""
+
+    parts = [f"{verb} {main_obj}{prefix_str}"]
+    for i, prep in enumerate(preps):
+        if i < len(remaining):
+            parts.append(f"{prep} {remaining[i]}")
+        else:
+            parts.append(prep)
+
+    return " ".join(parts)

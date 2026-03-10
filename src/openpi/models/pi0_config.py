@@ -15,8 +15,7 @@ import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
-
-
+    
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
@@ -114,3 +113,14 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+@dataclasses.dataclass(frozen=True)
+class Pi05SubtaskConfig(Pi0Config):
+    """Config for Pi0.5 with subtask CE loss + flow-matching action loss."""
+
+    pi05: bool = True
+
+    @property
+    @override
+    def model_type(self) -> _model.ModelType:
+        return _model.ModelType.PI05_SUBTASK

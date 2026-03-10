@@ -33,7 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
-
+    PI05_SUBTASK = "pi05_subtask"
 
 # The model always expects these images
 IMAGE_KEYS = (
@@ -112,6 +112,18 @@ class Observation(Generic[ArrayT]):
 
     # Point cloud.
     pcd_xyz: at.Float[ArrayT, "*b pc_s n 3"] | None = None
+    
+    # Tokenized subtask text (ground truth).
+    subtask_tokens: at.Int[ArrayT, "*b sl"] | None = None
+
+    # Subtask token mask (True for valid tokens, False for padding).
+    subtask_token_mask: at.Bool[ArrayT, "*b sl"] | None = None
+    
+    # Token auto-regressive mask.
+    # For PI05_SUBTASK: AR on subtask portion (0=bidirectional, 1=causal).
+    token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
+    # For PI05_SUBTASK: CE loss on subtask+EOS tokens only.
+    token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":

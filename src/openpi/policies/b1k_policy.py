@@ -132,7 +132,7 @@ class B1kInputs(transforms.DataTransformFn):
             meta_image_names.append("base_0_seg")
 
         match self.model_type:
-            case _model.ModelType.PI0 | _model.ModelType.PI05:
+            case _model.ModelType.PI0 | _model.ModelType.PI05 | _model.ModelType.PI05_SUBTASK:
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
                 images = (base_image, wrist_image_left, wrist_image_right)
                 image_masks = (np.True_, np.True_, np.True_)

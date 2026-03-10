@@ -5,13 +5,25 @@ set -x # DEBUG PRINT
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-source /mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/miniconda3/etc/profile.d/conda.sh
-conda activate openpi-comet-nas
-export PYTHONPATH="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/miniconda3/envs/openpi-comet-nas/bin/python:$PYTHONPATH"
-export LD_LIBRARY_PATH="/mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/miniconda3/envs/openpi-comet-nas/lib:$LD_LIBRARY_PATH"
+source /mnt/bn/navigation-vla-data-1/mobile_manipulation/miniconda3/etc/profile.d/conda.sh
+conda activate openpi
+
+# for wandb
+# export PYTHONNOUSERSITE=1
+
+
+export HTTP_PROXY=http://sys-proxy-rd-relay.byted.org:8118
+export http_proxy=http://sys-proxy-rd-relay.byted.org:8118
+export https_proxy=http://sys-proxy-rd-relay.byted.org:8118
+
+export PYTHONPATH="/mnt/bn/navigation-vla-data-1/mobile_manipulation/miniconda3/envs/openpi/bin/python:$PYTHONPATH"
+export LD_LIBRARY_PATH="/mnt/bn/navigation-vla-data-1/mobile_manipulation/miniconda3/envs/openpi/lib:$LD_LIBRARY_PATH"
 
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${REPO_ROOT}/.cache/openpi}"
 export B1K_VIDEO_BACKEND="${B1K_VIDEO_BACKEND:-video_reader}"
+
+# 算子融合
+export TORCHDYNAMO_DISABLE=0 
 
 export OPENPI_OFFLINE="${OPENPI_OFFLINE:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
@@ -21,7 +33,7 @@ export OPENPI_PERSISTENT_WORKERS="${OPENPI_PERSISTENT_WORKERS:-1}"
 export OPENPI_DATALOADER_TIMEOUT_S="${OPENPI_DATALOADER_TIMEOUT_S:-600}"
 export OPENPI_DATALOADER_PREFETCH_FACTOR="${OPENPI_DATALOADER_PREFETCH_FACTOR:-2}"
 export OPENPI_DDP_TIMEOUT_MIN="${OPENPI_DDP_TIMEOUT_MIN:-120}"
-export OPENPI_LOAD_DATASET_NUM_PROC_CAP="${OPENPI_LOAD_DATASET_NUM_PROC_CAP:-8}"
+export OPENPI_LOAD_DATASET_NUM_PROC_CAP="${OPENPI_LOAD_DATASET_NUM_PROC_CAP:-32}"
 export OPENPI_HF_LOCAL_SYNC_TIMEOUT_S="${OPENPI_HF_LOCAL_SYNC_TIMEOUT_S:-7200}"
 export OPENPI_HF_LOCAL_SYNC_POLL_S="${OPENPI_HF_LOCAL_SYNC_POLL_S:-2}"
 
@@ -40,15 +52,15 @@ NNODES=${ARNOLD_WORKER_NUM}
 NODE_RANK=${ARNOLD_ID}
 WORLD_SIZE="$((NNODES * NPROC_PER_NODE))"
 
-CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-pt50_cs32_bs64_lr2.5e-5_5ep}"
+CONFIG_NAME="${CONFIG_NAME:-pi05_subtask_b1k-pt50_cs32_bs64_lr2.5e-5_5ep}"
 NUM_EPOCHS="${NUM_EPOCHS:-5}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-1000}"
 KEEP_PERIOD="${KEEP_PERIOD:-5000}"
-FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-1}"
+FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-0}"
 PREPARE_HF_CACHE_ONLY="${PREPARE_HF_CACHE_ONLY:-0}"
 
-PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-64}"
-NUM_WORKERS="${NUM_WORKERS:-16}"
+PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-16}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
 
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
 PRECISION="${PRECISION:-bfloat16}"
@@ -163,6 +175,14 @@ echo "OPENPI_DDP_TIMEOUT_MIN: ${OPENPI_DDP_TIMEOUT_MIN}"
 echo "OPENPI_LOAD_DATASET_NUM_PROC_CAP: ${OPENPI_LOAD_DATASET_NUM_PROC_CAP}"
 echo "OPENPI_HF_LOCAL_SYNC_TIMEOUT_S: ${OPENPI_HF_LOCAL_SYNC_TIMEOUT_S}"
 echo "OPENPI_HF_LOCAL_SYNC_POLL_S: ${OPENPI_HF_LOCAL_SYNC_POLL_S}"
+
+
+#### for Normalization Stats
+
+# if [[ "${NODE_RANK}" == "0" ]]; then
+#     echo "Running compute_norm_stats.py on master node..."
+#     python scripts/compute_norm_stats.py --config-name "${CONFIG_NAME}"
+# fi
 
 torchrun \
   --master_addr="${MASTER_ADDR}" \
