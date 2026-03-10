@@ -21,7 +21,7 @@ class GemmaTokenExpert(ActionExpert):
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = model._prepare_attention_masks_4d(prefix_att_2d_masks)
 
-        model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "sdpa" 
         _, past_key_values = model.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -183,7 +183,7 @@ class GemmaTokenExpert(ActionExpert):
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
         full_att_2d_masks_4d = model._prepare_attention_masks_4d(full_att_2d_masks)
 
-        model.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        model.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "sdpa"  # noqa: SLF001
         outputs_embeds, _ = model.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,

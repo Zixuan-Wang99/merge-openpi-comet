@@ -63,7 +63,66 @@ import openpi.models_pytorch.vlm2.vlm2_model as _vlm2_model
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import os as _os
 
+class CUDAPrefetcher:
+    """
+    Prefetch next batch to GPU using a separate CUDA stream.
+    This overlaps host-to-device memory copies with GPU computation, effectively hiding data transfer latency.
+    """
+    def __init__(self, loader, device):
+        self._loader = loader
+        self._device = device
+        self._stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self._iter = None
+        self._next_obs = None
+        self._next_act = None
+
+    def __iter__(self):
+        self._iter = iter(self._loader)
+        self._preload()
+        return self
+
+    def _to_device(self, x):
+        if isinstance(x, torch.Tensor):
+            return x.to(self._device, non_blocking=True)
+        return x
+
+    def _preload(self):
+        try:
+            observation, actions = next(self._iter)
+        except StopIteration:
+            self._next_obs = None
+            self._next_act = None
+            return
+        if self._stream is not None:
+            with torch.cuda.stream(self._stream):
+                self._next_obs = jax.tree.map(self._to_device, observation)
+                self._next_act = actions.to(device=self._device, dtype=torch.float32, non_blocking=True)
+        else:
+            self._next_obs = jax.tree.map(self._to_device, observation)
+            self._next_act = actions.to(device=self._device, dtype=torch.float32, non_blocking=True)
+
+    def __next__(self):
+        if self._stream is not None:
+            torch.cuda.current_stream(self._device).wait_stream(self._stream)
+        obs = self._next_obs
+        act = self._next_act
+        if obs is None:
+            raise StopIteration
+        self._preload()
+        return obs, act
+
+def _torch_tree_map(fn, obj):
+    """Apply fn to all tensors in a nested structure (dict/list/tuple/namedtuple)."""
+    if isinstance(obj, torch.Tensor):
+        return fn(obj)
+    if isinstance(obj, dict):
+        return {k: _torch_tree_map(fn, v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        mapped = [_torch_tree_map(fn, item) for item in obj]
+        return type(obj)(mapped) if isinstance(obj, tuple) else mapped
+    return obj
 
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -511,7 +570,16 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
-
+    
+    # Enable TF32 and cuDNN benchmark unconditionally 
+    # These are safe for bf16 training and improve Tensor Core throughput.
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Expandable segments reduces fragmentation for large models
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    
     # Initialize checkpoint directory and wandb
     resuming = False
     if config.resume:
@@ -806,6 +874,8 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
+        # When available, fuses parameter update into a single CUDA kernel, reducing kernel launch overhead.
+        fused=torch.cuda.is_available(),
     )
 
     # Load checkpoint if resuming
@@ -870,17 +940,22 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
 
     last_epoch_logged = None
     while global_step < config.num_train_steps:
-        for observation, actions in loader:
+        
+        # Overlaps H2D data transfer with GPU computation using a separate CUDA stream.
+        prefetcher = CUDAPrefetcher(loader, device)
+
+        for observation, actions in prefetcher:
+
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(  # noqa: PLW2901
-                lambda x: x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
-                observation,
-            )
-            actions = actions.to(device=device, dtype=torch.float32, non_blocking=True)  # noqa: PLW2901
+            # # The unified data loader returns (observation, actions) tuple
+            # observation = jax.tree.map(  # noqa: PLW2901
+            #     lambda x: x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
+            #     observation,
+            # )
+            # actions = actions.to(device=device, dtype=torch.float32, non_blocking=True)  # noqa: PLW2901
 
             # Update LR
             for pg in optim.param_groups:
@@ -916,7 +991,7 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 flow_loss = loss
                 subtask_loss_val = torch.tensor(0.0, device=device)
 
-            loss = loss.float()
+            # loss = loss.float()
 
             # Backward pass
             loss.backward()
@@ -932,11 +1007,11 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             optim.step()
             optim.zero_grad(set_to_none=True)
 
-            # Clear gradients more aggressively
-            for param in optim_params:
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
+            # # Clear gradients more aggressively
+            # for param in optim_params:
+            #     if param.grad is not None:
+            #         param.grad.detach_()
+            #         param.grad = None
 
             # Collect stats
             if is_main:

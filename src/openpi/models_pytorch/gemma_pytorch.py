@@ -39,6 +39,8 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
+        
+        vlm_config_hf.text_config._attn_implementation = "sdpa"
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
@@ -53,6 +55,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             use_adarms=use_adarms[1],
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
+
+        action_expert_config_hf._attn_implementation = "sdpa"
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
@@ -141,19 +145,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                     self.gemma_expert.model.gradient_checkpointing = True
                 use_gradient_checkpointing = True
 
-            # Debug gradient checkpointing status
-            if hasattr(self, "_debug_gc_printed") and not self._debug_gc_printed:
-                print(f"Gemma expert model gradient checkpointing: {use_gradient_checkpointing}")
-                print(f"Model training mode: {self.training}")
-                print(
-                    f"Gemma expert model has gradient_checkpointing attr: {hasattr(self.gemma_expert.model, 'gradient_checkpointing')}"
-                )
-                if hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                    print(
-                        f"Gemma expert model gradient_checkpointing value: {self.gemma_expert.model.gradient_checkpointing}"
-                    )
-                self._debug_gc_printed = True
-
             # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
                 models = [self.paligemma.language_model, self.gemma_expert.model]
@@ -196,15 +187,18 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
-
+                
+                num_key_value_groups = self.paligemma.language_model.layers[layer_idx].self_attn.num_key_value_groups
                 # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
+                att_output, _ = modeling_gemma.sdpa_attention_forward_standalone(
                     query_states,
                     key_states,
                     value_states,
                     attention_mask,
                     scaling,
+                    num_key_value_groups=num_key_value_groups,
+                    dropout=0.0,
+                    training=self.training,
                 )
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
