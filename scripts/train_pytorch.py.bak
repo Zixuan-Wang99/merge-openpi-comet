@@ -52,7 +52,6 @@ import safetensors.torch
 import torch
 import torch.distributed as dist
 import torch.nn.parallel
-import torch._dynamo
 import tqdm
 import wandb
 
@@ -303,9 +302,7 @@ def configure_hf_cache(config: _config.TrainConfig, *, is_main: bool, use_ddp: b
         os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-    # 不再全局禁用 torch.compile
-    # 仅在显式关闭时才 disable
-    if os.environ.get("OPENPI_DISABLE_COMPILE", "0") == "1":
+    if os.environ.get("OPENPI_TORCH_COMPILE_SAMPLE_ACTIONS", "0") != "1":
         os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
     checkpoints_root = Path(config.checkpoint_base_dir).expanduser().resolve()
@@ -957,18 +954,6 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
                 strict=load_strict,
             )
             logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
-    
-    if os.environ.get("OPENPI_TORCH_COMPILE", "1") == "1" and torch.cuda.is_available():
-        try:
-            torch._dynamo.config.suppress_errors = True
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                # DDP 场景：编译 DDP 内部的 module
-                model.module = torch.compile(model.module, mode="default", fullgraph=False)
-            else:
-                model = torch.compile(model, mode="default", fullgraph=False)
-            logging.info("[OPTIMIZATION] torch.compile applied with mode=default")
-        except Exception as e:
-            logging.warning(f"[OPTIMIZATION] torch.compile failed: {e}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -1247,10 +1232,9 @@ def train_loop(config: _config.TrainConfig, *, formatter: logging.Formatter):
             # Update progress bar
             if pbar is not None:
                 pbar.update(1)
-                if should_log:  # [OPTIMIZATION] Only call .item() at log intervals to avoid CUDA sync
-                    pbar.set_postfix(
-                        {"loss": f"{loss.detach().float().item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
-                    )
+                pbar.set_postfix(
+                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                )
 
     # Close progress bar
     if pbar is not None:

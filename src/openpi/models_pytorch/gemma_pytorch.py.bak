@@ -173,11 +173,14 @@ class PaliGemmaWithExpertModel(nn.Module):
                 key_states = torch.cat(key_states, dim=2)
                 value_states = torch.cat(value_states, dim=2)
 
-                # Avoid dummy_tensor allocation — rotary_emb only needs device/dtype from input
-                cos, sin = self.paligemma.model.language_model.rotary_emb(
-                    query_states[:, 0, :, :],  # [B, S, head_dim] view, no allocation
-                    position_ids
+                dummy_tensor = torch.zeros(
+                    query_states.shape[0],
+                    query_states.shape[2],
+                    query_states.shape[-1],
+                    device=query_states.device,
+                    dtype=query_states.dtype,
                 )
+                cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
                 query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, unsqueeze_dim=1
                 )
@@ -214,7 +217,7 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
-                    after_first_residual = out_emb  # No clone needed: subsequent ops are non-inplace
+                    after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
                     # Convert to bfloat16 if the next layer (mlp) uses bfloat16
                     if layer.mlp.up_proj.weight.dtype == torch.bfloat16:

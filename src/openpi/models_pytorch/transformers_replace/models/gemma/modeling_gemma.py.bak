@@ -28,17 +28,6 @@ from typing import Callable, Optional, Union
 import torch
 from torch import nn
 import torch.nn.functional as F
-# [OPTIMIZATION] FlexAttention support (PyTorch >= 2.5)
-import os as _os
-_USE_FLEX_ATTENTION = False
-try:
-    from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask as _create_block_mask
-    if _os.environ.get("OPENPI_USE_FLEX_ATTENTION", "1") == "1":
-        _USE_FLEX_ATTENTION = True
-        _flex_attention = torch.compile(_flex_attention, dynamic=False)
-except (ImportError, AttributeError):
-    pass
-
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -340,67 +329,21 @@ def sdpa_attention_forward_standalone(
     training: bool = False,
 ):
     """
-    Standalone SDPA attention forward for MoT joint attention.
-    
-    Supports multiple backends:
-    1. FlexAttention (PyTorch >= 2.5, best for custom masks + torch.compile)
-    2. SDPA with enable_gqa=True (PyTorch native)
-    3. SDPA with repeat_kv fallback
+    Standalone SDPA attention forward — does not require a module reference.
+    Used by gemma_pytorch.py's compute_layer_complete where we concatenate
+    Q/K/V across VLM + expert before computing joint attention.
     
     Args:
-        query: [B, num_heads, S, head_dim]     — 8 heads
-        key:   [B, num_kv_heads, S, head_dim]   — 1 head (GQA 8:1)
-        value: [B, num_kv_heads, S, head_dim]   — 1 head (GQA 8:1)
-        attention_mask: [B, 1, S, S] additive mask (0 = attend, large negative = mask)
-                        MoT mixed bidirectional+causal mask. NOT standard causal.
-        scaling: head_dim ** -0.5
-        num_key_value_groups: num_heads // num_kv_heads = 8
+        query: [B, num_heads, S, head_dim]
+        key: [B, num_kv_heads, S, head_dim]
+        value: [B, num_kv_heads, S, head_dim]
+        attention_mask: [B, 1, S, S] additive mask (0 = attend, -inf = mask) or None
+        scaling: attention scaling factor (head_dim ** -0.5)
+        num_key_value_groups: num_heads // num_kv_heads for GQA
+        dropout: dropout probability
+        training: whether in training mode
     """
-    # FlexAttention path — best for custom masks under torch.compile
-    if _USE_FLEX_ATTENTION and query.is_cuda and attention_mask is not None:
-        try:
-            return _flex_attn_path(query, key, value, attention_mask, scaling,
-                                   num_key_value_groups, dropout, training)
-        except Exception:
-            pass  # fallback to SDPA
-    
-    # SDPA path — compatible with torch.compile for automatic kernel selection
-    return _sdpa_attn_path(query, key, value, attention_mask, scaling,
-                           num_key_value_groups, dropout, training)
-
-
-def _flex_attn_path(query, key, value, attention_mask, scaling,
-                     num_key_value_groups, dropout, training):
-    """FlexAttention: native support for arbitrary attention mask patterns."""
-    B, H_q, S, D = query.shape
-    
-    # Convert additive mask to boolean
-    causal_mask = attention_mask[:, 0, :, :S]  # [B, S, S]
-    bool_mask = causal_mask > -1.0  # [B, S, S]
-    
-    # Create BlockMask for efficient sparse attention
-    def mask_mod(b, h, q_idx, kv_idx):
-        return bool_mask[b, q_idx, kv_idx]
-    
-    block_mask = _create_block_mask(
-        mask_mod, B=B, H=None, Q_LEN=S, KV_LEN=S, device=query.device,
-    )
-    
-    attn_output = _flex_attention(
-        query, key, value,
-        block_mask=block_mask,
-        scale=scaling,
-        enable_gqa=(H_q != key.shape[1]),
-    )
-    
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, None
-
-
-def _sdpa_attn_path(query, key, value, attention_mask, scaling,
-                     num_key_value_groups, dropout, training):
-    """PyTorch SDPA path — optimized under torch.compile."""
-    # GQA handling
+    # Try native GQA support
     use_native_gqa = False
     if num_key_value_groups > 1:
         try:
@@ -414,7 +357,7 @@ def _sdpa_attn_path(query, key, value, attention_mask, scaling,
         key = repeat_kv(key, num_key_value_groups)
         value = repeat_kv(value, num_key_value_groups)
 
-    # Convert to boolean mask for better kernel selection under torch.compile
+    # Convert additive mask to boolean
     attn_mask = None
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key.shape[-2]]
@@ -422,21 +365,32 @@ def _sdpa_attn_path(query, key, value, attention_mask, scaling,
 
     dropout_p = dropout if training else 0.0
 
-    if use_native_gqa:
-        attn_output = F.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            scale=scaling,
-            enable_gqa=True,
-        )
-    else:
-        attn_output = F.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            scale=scaling,
-        )
+    if num_key_value_groups > 1:
+        try:
+            # PyTorch >= 2.5: 原生 GQA，不需要 repeat_kv
+            attn_output = F.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                scale=scaling,
+                enable_gqa=True,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            return attn_output, None
+        except TypeError:
+            pass  # fallback 到下面的 repeat_kv 路径
+
+    # Fallback：和原来完全一致
+    if num_key_value_groups > 1:
+        key = repeat_kv(key, num_key_value_groups)
+        value = repeat_kv(value, num_key_value_groups)
+
+    attn_output = F.scaled_dot_product_attention(
+        query, key, value,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        scale=scaling,
+    )
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, None

@@ -26,6 +26,8 @@ export B1K_VIDEO_BACKEND="${B1K_VIDEO_BACKEND:-video_reader}"
 export TORCHDYNAMO_DISABLE=0
 # CUDA memory allocator — expandable segments reduce fragmentation
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8}"
+
 # cuDNN benchmarking and v8 API for faster convolutions
 export TORCH_CUDNN_V8_API_ENABLED=1
 # Prefer FlashAttention-2 backend. Memory-efficient is fallback.
@@ -66,7 +68,7 @@ KEEP_PERIOD="${KEEP_PERIOD:-5000}"
 FORCE_LOAD_CACHE="${FORCE_LOAD_CACHE:-0}"
 PREPARE_HF_CACHE_ONLY="${PREPARE_HF_CACHE_ONLY:-0}"
 
-PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-32}"
+PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-48}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
